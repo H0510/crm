@@ -372,8 +372,14 @@ class AddressBookCollector:
                 screens += 1
                 time.sleep(0.5)
                 if _list_still(before_scroll, screen_reader.capture_window(window.hwnd)):
-                    # 滚轮推不动列表了，就是已经见底；再往下只会把最后几个人重读一遍
-                    break
+                    # 滚不动有两种可能：真到底了，或者窗口刚被拖走、滚轮落到了窗口外。
+                    # 取一次新位置再滚一遍，还是不动才算到底
+                    window = self._window(window)
+                    before_scroll = screen_reader.capture_window(window.hwnd)
+                    self._scroll(window)
+                    time.sleep(0.5)
+                    if _list_still(before_scroll, screen_reader.capture_window(window.hwnd)):
+                        break
 
             if job["state"] == "running":
                 job["state"] = "completed"
@@ -464,6 +470,9 @@ class AddressBookCollector:
         wait = max(float(job["settle_seconds"]), 0.5)
         record: dict = {}
         for index, ratio in enumerate((0.16, 0.22)):
+            if index:
+                # 第一遍点完没反应，可能就是窗口刚被拖走了，重取位置再试
+                window = self._window(window)
             offset = 0 if index == 0 else 8
             friend_sender.click_point(
                 window, int(width * ratio), int(row["y"]) + offset, self.adapter
@@ -476,13 +485,19 @@ class AddressBookCollector:
                     return record, False
         return record, True
 
+    def _window(self, window: wechat_detector.WindowInfo) -> wechat_detector.WindowInfo:
+        """取一次最新窗口位置；窗口被拖动过时坐标会整体平移，按旧位置点会点空。"""
+        fresh = self.adapter.find_window(hwnd=window.hwnd)
+        return fresh or window
+
     def _scroll(self, window: wechat_detector.WindowInfo) -> None:
         # 实测一格滚轮约 25px、联系人行约 54px，9 次（18 格）推进约 8 行，
         # 视野内保留 1~2 行的重叠，既不漏人也不会每屏只前进一个人
-        _wheel(window, -240, 9)
+        _wheel(self._window(window), -240, 9)
 
     def _scroll_to_top(self, window: wechat_detector.WindowInfo) -> None:
         """先把焦点放到左侧列表并回到顶部，避免从中间开始采集。"""
+        window = self._window(window)
         width, height = _window_size(window)
         x = int(window.rect[0] + width * 0.2)
         y = int(window.rect[1] + height * 0.45)
@@ -492,6 +507,7 @@ class AddressBookCollector:
         user32.mouse_event(0x0004, 0, 0, 0, None)
         time.sleep(0.15)
         for _ in range(4):
+            window = self._window(window)
             _wheel(window, 120, 800)
             time.sleep(0.5)
             if self._at_list_top(window):
