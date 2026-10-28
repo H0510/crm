@@ -1,0 +1,12 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+psutil>=5.9
+pillow>=10.0
+winsdk>=1.0.0b10
+
+# UIA 能力探测用；必须 2.0 以上，1.1.x 在 Python 3.13 下退出时会触发访问冲突
+uiautomation>=2.0.29
+
+# 开发/测试
+pytest>=8.0
+httpx>=0.27
