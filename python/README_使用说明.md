@@ -69,7 +69,7 @@ python -m uvicorn wechat_service.main:app --host 127.0.0.1 --port 8756
 1. 微信停在「通讯录 → 联系人」页，列表停在哪个位置都可以，任务开始时会先滚回顶部。
 2. 页面「通讯录采集」里填采集人数和每行等待（默认 0.6 秒），点「开始采集」。程序按头像像素定位可点击的联系人行，逐个点开右侧资料卡，读微信号、电话、备注、地区，企业微信分组那种没有头像的灰色组织名会被跳过。
 3. 进度条按本次识别到的联系人数走。重复采集同一个人会更新原记录，不会新增重复行；已提交过好友申请的记录也会照常更新资料，不影响添加任务。
-4. 中途可以取消；滚到通讯录最底部时任务自己结束，不会停在底部反复点最后几个人。采集结果用「导出 CSV」拿 `GET /api/candidates/export.csv`，也可以在「界面读取结果」里看最近几条。
+4. 中途可以取消；滚到通讯录最底部时任务自己结束，不会停在底部反复点最后几个人。采集中途拖动微信窗口也没关系，每屏都会重新读一次窗口位置。采集结果用「导出 CSV」拿 `GET /api/candidates/export.csv`，也可以在「界面读取结果」里看最近几条。
 5. 微信号只接受合法微信号格式，企业微信联系人卡片上显示的是企业名，不会被当成微信号写进库。
 
 对应接口：`POST /api/collect/address-book`（`max_contacts` 1 到 3000，`settle_seconds` 0.3 到 2.0）、`GET /api/collect/jobs/{job_id}`、`POST /api/collect/jobs/{job_id}/cancel`、`GET /api/candidates/export.csv`。任务状态是 `running / completed / cancelled / failed`，同一时间只允许一个任务占用微信窗口。
