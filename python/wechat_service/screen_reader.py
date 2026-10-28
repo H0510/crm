@@ -211,12 +211,14 @@ async def _recognize_async(image_path: str, language: str) -> list[dict]:
     return lines
 
 
-def ocr_image(image: Image.Image, language: str = OCR_LANGUAGE) -> list[dict]:
+def ocr_image(
+    image: Image.Image, language: str = OCR_LANGUAGE, scale: int = OCR_SCALE
+) -> list[dict]:
     """对 PIL 图像做 OCR，返回带坐标的文本行。
 
     小字号直接识别容易漏字，统一放大 OCR_SCALE 倍，坐标再换算回原图。
+    资料页需要更高识别精度时可以传入更大的 scale。
     """
-    scale = OCR_SCALE
     if scale != 1:
         image = image.resize(
             (max(1, image.width * scale), max(1, image.height * scale)),

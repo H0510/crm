@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 from pathlib import Path
 
@@ -16,6 +19,7 @@ from pydantic import BaseModel, Field
 from shared import wechat_types as types
 
 from . import (
+    address_book_collector,
     contact_matcher,
     contact_reader,
     friend_search,
@@ -75,9 +79,15 @@ class SendPayload(BaseModel):
     confirmed: bool = Field(default=False, description="点击发送必须由用户显式确认")
 
 
+class CollectPayload(BaseModel):
+    max_contacts: int = Field(default=1000, ge=1, le=3000)
+    settle_seconds: float = Field(default=0.6, ge=0.3, le=2.0)
+
+
 def create_app(db_path: str | Path | None = None) -> FastAPI:
     database = WeChatDatabase(db_path or DEFAULT_DB_PATH)
     adapter = WeChatUiAdapter()
+    collector = address_book_collector.AddressBookCollector(database, adapter)
 
     app = FastAPI(
         title="GeoAI 微信桌面自动化本地服务",
@@ -93,6 +103,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     )
     app.state.database = database
     app.state.adapter = adapter
+    app.state.collector = collector
 
     @app.get("/health")
     def health() -> dict:
@@ -188,6 +199,85 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @app.get("/api/candidates")
     def list_candidates() -> dict:
         return {"candidates": database.list_candidates()}
+
+    @app.get("/api/candidates/export.csv")
+    def export_candidates() -> Response:
+        buffer = io.StringIO()
+        buffer.write("\ufeff")
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                "微信号",
+                "电话",
+                "电话原始值",
+                "电话置信度",
+                "昵称",
+                "备注",
+                "地区",
+                "邮箱",
+                "来源",
+                "置信度",
+                "采集时间",
+            ]
+        )
+        for row in database.list_candidates():
+            try:
+                fields = json.loads(row.get("fields_json") or "{}")
+            except json.JSONDecodeError:
+                fields = {}
+            phone_field = fields.get("phone") or {}
+            writer.writerow(
+                [
+                    row.get("wechat_id") or "",
+                    row.get("phone") or "",
+                    phone_field.get("raw") or "",
+                    phone_field.get("confidence") or "",
+                    row.get("nickname") or "",
+                    row.get("remark") or "",
+                    row.get("region") or "",
+                    row.get("email") or "",
+                    row.get("source") or "",
+                    row.get("confidence") or "",
+                    row.get("scanned_at") or "",
+                ]
+            )
+        return Response(
+            content=buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="wechat_contacts.csv"',
+            },
+        )
+
+    # ------------------------------------------------------------ 通讯录采集
+
+    @app.post("/api/collect/address-book")
+    def start_address_book_collect(payload: CollectPayload | None = None) -> dict:
+        data = payload or CollectPayload()
+        try:
+            job = collector.start(
+                max_contacts=data.max_contacts,
+                settle_seconds=data.settle_seconds,
+            )
+        except address_book_collector.AutomationBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"job": job}
+
+    @app.get("/api/collect/jobs/{job_id}")
+    def get_collect_job(job_id: str) -> dict:
+        try:
+            return {"job": collector.get(job_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/collect/jobs/{job_id}/cancel")
+    def cancel_collect_job(job_id: str) -> dict:
+        try:
+            return {"job": collector.cancel(job_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/contacts/{crm_contact_id}/match")
     def match_contact(crm_contact_id: str) -> dict:

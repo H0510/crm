@@ -226,9 +226,13 @@ def force_foreground(hwnd: int) -> bool:
     if user32.GetForegroundWindow() == hwnd:
         return True
 
-    user32.SwitchToThisWindow(hwnd, True)
-    time.sleep(0.2)
-    return user32.GetForegroundWindow() == hwnd
+    # SwitchToThisWindow 偶尔会被系统拒绝（前台窗口刚抢回焦点），重试几次再判失败
+    for _ in range(3):
+        user32.SwitchToThisWindow(hwnd, True)
+        time.sleep(0.2)
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+    return False
 
 
 def paste_search_key() -> None:

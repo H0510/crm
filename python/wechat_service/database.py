@@ -105,6 +105,27 @@ class WeChatDatabase:
     def init_schema(self) -> None:
         with self.connection() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_candidates(connection)
+
+    @staticmethod
+    def _migrate_candidates(connection: sqlite3.Connection) -> None:
+        """给旧库补采集字段，只加列，不改已有列。"""
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(wechat_candidates)")
+        }
+        additions = {
+            "remark": "TEXT NOT NULL DEFAULT ''",
+            "region": "TEXT NOT NULL DEFAULT ''",
+            "email": "TEXT NOT NULL DEFAULT ''",
+            "source": "TEXT NOT NULL DEFAULT ''",
+            "fields_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, definition in additions.items():
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE wechat_candidates ADD COLUMN {column} {definition}"
+                )
 
     # ------------------------------------------------------------ 联系人
 
@@ -263,6 +284,79 @@ class WeChatDatabase:
                 "SELECT * FROM wechat_candidates ORDER BY confidence DESC, id DESC"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def save_profile_candidate(self, item: dict) -> dict:
+        """保存通讯录采集结果：有微信号按微信号去重，否则按昵称加电话。"""
+        now = item.get("scanned_at") or _now()
+        wechat_id = (item.get("wechat_id") or "").strip()
+        nickname = (item.get("nickname") or "").strip()
+        phone = (item.get("phone") or "").strip()
+        values = (
+            int(item.get("hwnd") or 0),
+            item.get("window_title") or "",
+            item.get("raw_text") or "",
+            nickname,
+            phone,
+            wechat_id,
+            item.get("confidence") or "low",
+            int(item.get("x") or 0),
+            int(item.get("y") or 0),
+            int(item.get("width") or 0),
+            int(item.get("height") or 0),
+            now,
+            item.get("remark") or "",
+            item.get("region") or "",
+            item.get("email") or "",
+            item.get("source") or "address_book",
+            item.get("fields_json") or "{}",
+        )
+
+        with self.connection() as connection:
+            row = None
+            if wechat_id:
+                row = connection.execute(
+                    """
+                    SELECT id, confidence FROM wechat_candidates
+                     WHERE wechat_id <> '' AND lower(wechat_id) = lower(?)
+                     ORDER BY id DESC LIMIT 1
+                    """,
+                    (wechat_id,),
+                ).fetchone()
+            if row is None and (nickname or phone):
+                row = connection.execute(
+                    """
+                    SELECT id, confidence FROM wechat_candidates
+                     WHERE lower(nickname) = lower(?) AND phone = ?
+                     ORDER BY id DESC LIMIT 1
+                    """,
+                    (nickname, phone),
+                ).fetchone()
+
+            if row:
+                connection.execute(
+                    """
+                    UPDATE wechat_candidates
+                       SET hwnd = ?, window_title = ?, raw_text = ?, nickname = ?,
+                           phone = ?, wechat_id = ?, confidence = ?, x = ?, y = ?,
+                           width = ?, height = ?, scanned_at = ?, remark = ?,
+                           region = ?, email = ?, source = ?, fields_json = ?
+                     WHERE id = ?
+                    """,
+                    values + (row["id"],),
+                )
+                return {"id": row["id"], "action": "updated"}
+
+            cursor = connection.execute(
+                """
+                INSERT INTO wechat_candidates
+                    (hwnd, window_title, raw_text, nickname, phone, wechat_id,
+                     confidence, x, y, width, height, scanned_at, remark,
+                     region, email, source, fields_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            return {"id": int(cursor.lastrowid), "action": "created"}
 
     # ------------------------------------------------------------ 任务
 

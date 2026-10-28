@@ -208,12 +208,50 @@
 
           <section class="block">
             <div class="block__head">
+              <h3>通讯录采集</h3>
+              <span class="panel__hint">{{ collectStateText }}</span>
+            </div>
+            <div class="collect">
+              <label class="collect__field">
+                <span>采集人数</span>
+                <input v-model.number="collectForm.max_contacts" type="number" min="1" max="3000" />
+              </label>
+              <label class="collect__field">
+                <span>每行等待（秒）</span>
+                <input v-model.number="collectForm.settle_seconds" type="number" min="0.3" max="2" step="0.1" />
+              </label>
+              <div class="collect__actions">
+                <button class="btn btn--primary" :disabled="collectRunning || busy" @click="startCollect">
+                  开始采集
+                </button>
+                <button class="btn btn--ghost" :disabled="!collectRunning" @click="cancelCollect">
+                  取消
+                </button>
+                <a class="btn btn--ghost" :href="`${props.apiBase}/api/candidates/export.csv`" target="_blank" rel="noopener">
+                  导出 CSV
+                </a>
+              </div>
+            </div>
+            <div v-if="collectJob" class="collect__progress">
+              <div class="collect__bar"><span :style="{ width: `${collectPercent}%` }"></span></div>
+              <p class="collect__meta">
+                {{ collectStateText }} · 新增 {{ collectJob.created }} · 更新 {{ collectJob.updated }} · 已扫描
+                {{ collectJob.scanned }}
+                <template v-if="collectJob.current_nickname"> · 当前：{{ collectJob.current_nickname }}</template>
+              </p>
+              <p v-if="collectJob.last_error" class="collect__error">{{ collectJob.last_error }}</p>
+            </div>
+            <div v-else class="empty-cell">确认微信停在「通讯录 → 联系人」页后开始采集，程序会逐个打开资料卡读取微信号与电话</div>
+          </section>
+
+          <section class="block">
+            <div class="block__head">
               <h3>界面读取结果</h3>
               <span class="panel__hint">{{ candidates.length }} 条候选</span>
             </div>
             <ul v-if="candidates.length" class="candidate-list">
               <li v-for="item in candidates.slice(0, 8)" :key="`${item.id}`">
-                <span class="candidate-list__raw">{{ item.raw_text }}</span>
+                <span class="candidate-list__raw">{{ item.nickname || item.raw_text }}</span>
                 <span class="candidate-list__meta">
                   {{ item.phone || item.wechat_id || item.nickname || '—' }} ·
                   {{ confidenceText(item.confidence) }}
@@ -232,7 +270,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 const props = defineProps({
   apiBase: { type: String, default: 'http://127.0.0.1:8756' },
@@ -256,6 +294,22 @@ const busy = ref(false)
 const errorMessage = ref('')
 const noticeMessage = ref('')
 const screenshotUrl = ref('')
+
+const collectForm = ref({ max_contacts: 50, settle_seconds: 0.6 })
+const collectJob = ref(null)
+const collectRunning = computed(() => collectJob.value?.state === 'running')
+const collectPercent = computed(() => {
+  if (!collectJob.value) return 0
+  const total = collectJob.value.max_contacts || 1
+  const done = collectJob.value.collected ?? collectJob.value.created
+  return Math.min(100, Math.round((done / total) * 100))
+})
+const COLLECT_STATE_LABELS = { running: '采集中', completed: '已完成', cancelled: '已取消', failed: '失败' }
+const collectStateText = computed(() => {
+  if (!collectJob.value) return '未开始'
+  return COLLECT_STATE_LABELS[collectJob.value.state] || collectJob.value.state
+})
+let collectTimer = null
 
 const TASK_LABELS = {
   pending: '待处理',
@@ -427,6 +481,70 @@ async function scanWechat() {
   }
 }
 
+function stopCollectTimer() {
+  if (collectTimer) {
+    clearInterval(collectTimer)
+    collectTimer = null
+  }
+}
+
+async function loadCandidates() {
+  try {
+    const body = await request('/api/candidates')
+    candidates.value = body.candidates
+  } catch {
+    /* 采集结束时刷新候选失败不打断主流程 */
+  }
+}
+
+function applyCollectJob(job) {
+  collectJob.value = job
+  if (job.state === 'running') return
+  stopCollectTimer()
+  loadCandidates()
+}
+
+async function startCollect() {
+  errorMessage.value = ''
+  noticeMessage.value = ''
+  try {
+    const body = await request('/api/collect/address-book', {
+      method: 'POST',
+      body: JSON.stringify({
+        max_contacts: collectForm.value.max_contacts,
+        settle_seconds: collectForm.value.settle_seconds,
+      }),
+    })
+    applyCollectJob(body.job)
+    stopCollectTimer()
+    collectTimer = setInterval(async () => {
+      if (!collectJob.value) return
+      try {
+        const current = await request(`/api/collect/jobs/${collectJob.value.job_id}`)
+        applyCollectJob(current.job)
+      } catch (error) {
+        stopCollectTimer()
+        errorMessage.value = error.message
+      }
+    }, 2000)
+  } catch (error) {
+    errorMessage.value = error.message
+  }
+}
+
+async function cancelCollect() {
+  if (!collectJob.value) return
+  try {
+    const body = await request(`/api/collect/jobs/${collectJob.value.job_id}/cancel`, {
+      method: 'POST',
+      body: '{}',
+    })
+    applyCollectJob(body.job)
+  } catch (error) {
+    errorMessage.value = error.message
+  }
+}
+
 async function selectContact(contact) {
   selectedId.value = contact.crm_contact_id
   const windows = status.value.windows || []
@@ -562,6 +680,7 @@ async function runTransition(task, action) {
 }
 
 onMounted(refreshAll)
+onUnmounted(stopCollectTimer)
 </script>
 
 <style scoped>
@@ -993,6 +1112,77 @@ onMounted(refreshAll)
 .timeline__note {
   color: var(--muted);
   margin-left: auto;
+}
+
+.collect {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.collect__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.collect__field input {
+  width: 92px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.collect__actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.collect__actions .btn {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.collect__progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.collect__bar {
+  height: 4px;
+  border-radius: 2px;
+  background: #eef0f3;
+  overflow: hidden;
+}
+
+.collect__bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent, #2f7d5d);
+  transition: width 0.3s ease;
+}
+
+.collect__meta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.collect__error {
+  margin: 0;
+  font-size: 12px;
+  color: #b4423a;
 }
 
 .candidate-list {

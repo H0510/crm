@@ -64,13 +64,27 @@ python -m uvicorn wechat_service.main:app --host 127.0.0.1 --port 8756
 
 服务不提供批量建任务、不循环发送、不自动重试；自动点击只允许单条、核验为 `matched`、且带 `confirmed=true` 的任务。搜索框只粘贴不按回车，因为回车会打开「申请添加朋友」弹窗。
 
+## 通讯录采集（批量读微信号和联系方式）
+
+1. 微信停在「通讯录 → 联系人」页，列表停在哪个位置都可以，任务开始时会先滚回顶部。
+2. 页面「通讯录采集」里填采集人数和每行等待（默认 0.6 秒），点「开始采集」。程序按头像像素定位可点击的联系人行，逐个点开右侧资料卡，读微信号、电话、备注、地区，企业微信分组那种没有头像的灰色组织名会被跳过。
+3. 进度条按本次识别到的联系人数走。重复采集同一个人会更新原记录，不会新增重复行；已提交过好友申请的记录也会照常更新资料，不影响添加任务。
+4. 中途可以取消；滚到通讯录最底部时任务自己结束，不会停在底部反复点最后几个人。采集结果用「导出 CSV」拿 `GET /api/candidates/export.csv`，也可以在「界面读取结果」里看最近几条。
+5. 微信号只接受合法微信号格式，企业微信联系人卡片上显示的是企业名，不会被当成微信号写进库。
+
+对应接口：`POST /api/collect/address-book`（`max_contacts` 1 到 3000，`settle_seconds` 0.3 到 2.0）、`GET /api/collect/jobs/{job_id}`、`POST /api/collect/jobs/{job_id}/cancel`、`GET /api/candidates/export.csv`。任务状态是 `running / completed / cancelled / failed`，同一时间只允许一个任务占用微信窗口。
+
+实测：从列表顶部开始，846 人的通讯录整轮约 35 分钟。最近一轮全量跑完库里 837 条候选，682 条读到微信号，20 条读到手机号，709 条读到地区，433 条读到备注。
+
+列表最底部几个浅色头像（白猫、纯色插画）只有中间一小块和列表底色有色差，按头像色块高度判断会漏掉整行，表现出来就是拉到最底下还有几个人没采集就直接结束了。现在按行距推算缺行、确认那个位置确实有内容再补进去，见底时最后几位（`^_^`、`。`、`□□`）都能正常点开读到微信号。另外点击后如果资料卡没有换人，会换位置多等几拍重试，仍不换人就跳过这一行，不会把上一个人的资料重复写一遍。
+
 ## 接口清单
 
 状态类：
 `GET /health`、`GET /api/wechat/status`、`GET /api/wechat/windows`、`GET /api/wechat/add-friend-window`、`POST /api/wechat/probe`、`GET /api/wechat/windows/{hwnd}/screenshot`、`POST /api/wechat/windows/{hwnd}/ocr`
 
 联系人：
-`GET /api/contacts`、`POST /api/contacts`、`GET /api/contacts/{crm_contact_id}`、`POST /api/contacts/scan`、`GET /api/candidates`、`POST /api/contacts/{crm_contact_id}/match`
+`GET /api/contacts`、`POST /api/contacts`、`GET /api/contacts/{crm_contact_id}`、`POST /api/contacts/scan`、`GET /api/candidates`、`POST /api/contacts/{crm_contact_id}/match`、`POST /api/collect/address-book`、`GET /api/collect/jobs/{job_id}`、`POST /api/collect/jobs/{job_id}/cancel`、`GET /api/candidates/export.csv`
 
 任务：
 `GET /api/tasks`、`POST /api/tasks`、`GET /api/tasks/{id}`、`POST /api/tasks/{id}/transition`、`GET /api/tasks/{id}/events`、`POST /api/tasks/{id}/search`、`POST /api/tasks/{id}/send`
@@ -86,7 +100,7 @@ python -m uvicorn wechat_service.main:app --host 127.0.0.1 --port 8756
 
 环境：Windows + Python 3.13.15 + 微信 4.1.13.12，微信已登录。
 
-自动化测试 `python -m pytest tests -q`：46 项全部通过，0 失败。覆盖匹配逻辑、任务状态机、审计日志、搜索核验解析、账号识别、发送动作的按钮定位、HTTP 接口，以及真实微信环境集成测试。
+自动化测试 `python -m pytest tests -q`：62 项全部通过，0 失败。覆盖匹配逻辑、任务状态机、审计日志、搜索核验解析、账号识别、发送动作的按钮定位、资料页解析、HTTP 接口，以及真实微信环境集成测试。
 
 真实微信环境实测：
 
@@ -107,3 +121,5 @@ python -m uvicorn wechat_service.main:app --host 127.0.0.1 --port 8756
 - `POST /api/wechat/probe` 在微信登录状态下会让 `uiautomation` 抛出 `0x80010108`，进程可能不稳定；日常读取用 OCR，不要频繁调用探针。
 - `uiautomation` 必须用 2.0 以上版本。1.1.15 在 Python 3.13 下退出时会触发访问冲突，把服务带崩。
 - `WeChatManager.vue` 是按 Electron + Vue3 工程写的单文件组件，本仓库里没有 Electron 工程，页面未做编译和浏览器实测，集入工程后需要过一次界面验收。
+- 通讯录采集依赖资料卡本身把字段渲染出来：实测约三成联系人读不到微信号（卡片未渲染或字符粘连），电话大多没有。读不到就留空，不会猜测补齐。
+- 昵称优先取卡片顶部的显示名，顶部没读出来时退回「昵称：」字段；刻意的纯表情昵称 OCR 只能读出「0」之类的字符，属于识别上限。

@@ -35,7 +35,7 @@ INTERNAL_WINDOW_CLASSES = {
 }
 INTERNAL_WINDOW_CLASS_PREFIXES = ("SoPY_",)
 
-MAIN_WINDOW_TITLES = {"微信", "WeChat"}
+MAIN_WINDOW_TITLES = {"微信", "WeChat", "Weixin"}
 
 NOT_LOGGED_IN_HINTS = ("进入微信", "仅传输文件", "切换账号", "扫码登录", "使用手机扫码登录")
 LOGGED_IN_HINTS = (
@@ -200,22 +200,27 @@ def ui_windows(windows: Iterable[WindowInfo]) -> list[WindowInfo]:
 
 
 def pick_main_window(windows: Iterable[WindowInfo]) -> WindowInfo | None:
-    """挑选主窗口：优先标题为“微信”、类名为 Qt5 的窗口，其次取面积最大的 Qt5 窗口。"""
+    """挑选主窗口：先看是否可见，再看标题，最后比面积。
+
+    微信关掉主窗口后不会销毁旧窗口，旧窗口还留在枚举里但已经隐藏；
+    只按标题挑会挑到这个看不见的旧窗口，点击和截图都会落在空气上。
+    """
     candidates = [
         window
         for window in windows
         if window.class_name.startswith(QT_WINDOW_CLASS_PREFIX)
     ]
-    for candidate in candidates:
-        if candidate.title in MAIN_WINDOW_TITLES:
-            return candidate
-    if candidates:
-        return max(
-            candidates,
-            key=lambda item: (item.rect[2] - item.rect[0])
-            * (item.rect[3] - item.rect[1]),
+    if not candidates:
+        return None
+
+    def score(item: WindowInfo) -> tuple[int, int, int]:
+        return (
+            1 if item.visible and not item.minimized else 0,
+            1 if item.title in MAIN_WINDOW_TITLES else 0,
+            (item.rect[2] - item.rect[0]) * (item.rect[3] - item.rect[1]),
         )
-    return None
+
+    return max(candidates, key=score)
 
 
 def _pick_ocr_target(main_window: WindowInfo | None, windows: list[WindowInfo]) -> WindowInfo | None:
