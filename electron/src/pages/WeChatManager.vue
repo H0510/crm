@@ -2,7 +2,7 @@
   <div class="wechat-manager">
     <header class="topbar">
       <div class="topbar__identity">
-        <div class="topbar__logo">微信获客</div>
+        <div v-if="mode !== 'workbench'" class="topbar__logo">微信获客</div>
         <div class="topbar__status">
           <span class="pill" :class="statusPillClass">
             <i class="pill__dot"></i>
@@ -206,7 +206,7 @@
             <div v-else class="empty-cell">暂无操作记录</div>
           </section>
 
-          <section class="block">
+          <section v-if="mode !== 'workbench'" class="block">
             <div class="block__head">
               <h3>通讯录采集</h3>
               <span class="panel__hint">{{ collectStateText }}</span>
@@ -244,7 +244,7 @@
             <div v-else class="empty-cell">确认微信停在「通讯录 → 联系人」页后开始采集，程序会逐个打开资料卡读取微信号与电话</div>
           </section>
 
-          <section class="block">
+          <section v-if="mode !== 'workbench'" class="block">
             <div class="block__head">
               <h3>界面读取结果</h3>
               <span class="panel__hint">{{ candidates.length }} 条候选</span>
@@ -274,6 +274,8 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 const props = defineProps({
   apiBase: { type: String, default: 'http://127.0.0.1:8756' },
+  // workbench 模式只保留联系人匹配和好友申请工作台，采集与候选列表已拆到独立页面
+  mode: { type: String, default: 'full' },
 })
 
 const status = ref({

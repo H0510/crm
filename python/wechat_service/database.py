@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -16,7 +17,11 @@ from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "wechat_service.db"
+DATA_ROOT = Path(
+    os.environ.get("WECHAT_DATA_DIR")
+    or Path(__file__).resolve().parents[1] / "data"
+)
+DEFAULT_DB_PATH = DATA_ROOT / "wechat_service.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS crm_contacts (

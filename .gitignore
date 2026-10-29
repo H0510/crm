@@ -1,0 +1,14 @@
+# 依赖与构建产物
+electron/node_modules/
+electron/dist/
+electron/release/
+python/build/
+python/dist/
+*.spec
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地数据库与备份
+python/data/*.db

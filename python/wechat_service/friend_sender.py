@@ -178,6 +178,9 @@ def send_friend_request(
         lines = adapter.read_text(window.hwnd)
         add_button = find_text_line(lines, ADD_BUTTON_TEXT)
         if add_button is None:
+            # 对方已是好友时微信显示的是「发消息」，没有添加按钮
+            if find_text_line(lines, "发消息") is not None:
+                raise SendError("对方已经是好友，不需要再发好友申请")
             raise SendError("未识别到「添加到通讯录」按钮，请确认搜索结果仍显示在窗口中")
         click_line(window, add_button, adapter)
         time.sleep(CLICK_INTERVAL_SECONDS)

@@ -18,10 +18,13 @@ import logging
 import re
 import time
 from datetime import datetime
+from difflib import SequenceMatcher
+
+from PIL import ImageGrab
 
 from shared import wechat_types as types
 
-from . import contact_matcher, contact_reader, task_manager, wechat_detector
+from . import contact_matcher, contact_reader, screen_reader, task_manager, wechat_detector
 from .database import WeChatDatabase
 from .screen_reader import WindowCaptureError
 from .ui_adapter import WeChatUiAdapter
@@ -125,8 +128,17 @@ SWP_NOMOVE = 0x0002
 VK_MENU = 0x12
 VK_CONTROL = 0x11
 VK_V = 0x56
+VK_A = 0x41
+VK_ESCAPE = 0x1B
 KEYEVENTF_KEYUP = 0x0002
 PASTE_WAIT_SECONDS = 1.5
+
+# 微信「添加朋友」从主窗口搜索框右侧的「+」菜单进入
+ADD_FRIEND_MENU_HINT = "添加朋友"
+PLUS_BUTTON_X = 502
+PLUS_BUTTON_Y = 56
+# 「添加朋友」窗口里搜索框的纵向中心
+SEARCH_BOX_Y = 72
 
 
 class SearchError(RuntimeError):
@@ -146,6 +158,121 @@ def find_add_friend_window(adapter: WeChatUiAdapter) -> wechat_detector.WindowIn
         if "添加朋友" in title:
             return window
     return None
+
+
+def _press_escape() -> None:
+    user32.keybd_event(VK_ESCAPE, 0, 0, None)
+    time.sleep(0.03)
+    user32.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, None)
+
+
+def _open_add_friend_from_menu(window: wechat_detector.WindowInfo, adapter: WeChatUiAdapter) -> bool:
+    """点主窗口搜索框右侧的「+」，再点弹出菜单里的「添加朋友」。"""
+    from . import friend_sender  # 与 friend_sender 互相引用，放到函数内延迟导入
+
+    width, _ = (window.rect[2] - window.rect[0], window.rect[3] - window.rect[1])
+    # 900 宽三栏布局下「+」的中心在 (502, 56)；窗口更窄时按比例收一点，别点到窗口外
+    x = min(PLUS_BUTTON_X, int(width * 0.92))
+    friend_sender.click_point(window, x, PLUS_BUTTON_Y, adapter)
+    time.sleep(0.8)
+
+    try:
+        # 「+」弹出的菜单是独立的 Qt 弹窗，PrintWindow 截不到，只能抓屏幕区域
+        menu = ImageGrab.grab(bbox=tuple(window.rect))
+    except OSError:
+        return False
+
+    for line in screen_reader.ocr_image(menu):
+        text = "".join((line.get("text") or "").split())
+        if ADD_FRIEND_MENU_HINT not in text:
+            continue
+        center_x = int(line["x"] + line.get("width", 0) / 2)
+        center_y = int(line["y"] + line.get("height", 0) / 2)
+        friend_sender.click_point(window, center_x, center_y, adapter)
+        time.sleep(0.8)
+        return True
+
+    # 菜单没识别出来就按 Esc 收起，免得挡住后续操作
+    _press_escape()
+    return False
+
+
+def _select_all() -> None:
+    """全选搜索框里的内容，粘贴时直接覆盖上一次的搜索词。"""
+    user32.keybd_event(VK_CONTROL, 0, 0, None)
+    user32.keybd_event(VK_A, 0, 0, None)
+    time.sleep(0.05)
+    user32.keybd_event(VK_A, 0, KEYEVENTF_KEYUP, None)
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, None)
+    time.sleep(0.1)
+
+
+def _focus_search_box(window: wechat_detector.WindowInfo, adapter: WeChatUiAdapter) -> None:
+    """点一下「添加朋友」窗口的搜索框，粘贴才有落点。"""
+    from . import friend_sender
+
+    width = window.rect[2] - window.rect[0]
+    friend_sender.click_point(window, width // 2, SEARCH_BOX_Y, adapter)
+    time.sleep(0.3)
+
+
+def _click_search_button(window: wechat_detector.WindowInfo, adapter: WeChatUiAdapter) -> bool:
+    """点「添加朋友」窗口里搜索框右边的绿色「搜索」按钮。
+
+    这个窗口不像主界面搜索框那样边输边搜，粘完必须点一次「搜索」才会出结果。
+    """
+    from . import friend_sender
+
+    try:
+        image = screen_reader.capture_window(window.hwnd)
+    except WindowCaptureError:
+        return False
+    width, height = image.size
+    pixels = image.load()
+    xs: list[int] = []
+    ys: list[int] = []
+    for y in range(30, min(120, height)):
+        for x in range(int(width * 0.5), width):
+            red, green, blue = pixels[x, y][:3]
+            if green > 140 and red < 70 and blue < 150 and green - red > 80:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return False
+
+    center_x = (min(xs) + max(xs)) // 2
+    center_y = (min(ys) + max(ys)) // 2
+    friend_sender.click_point(window, center_x, center_y, adapter)
+    time.sleep(1.5)
+    return True
+
+
+def ensure_add_friend_window(
+    adapter: WeChatUiAdapter, main_window: wechat_detector.WindowInfo | None = None
+) -> wechat_detector.WindowInfo:
+    """确保「添加朋友」窗口已打开，没有就自己从主窗口的「+」菜单里点开。"""
+    window = find_add_friend_window(adapter)
+    if window is not None:
+        return window
+
+    main = main_window or wechat_detector.pick_main_window(adapter.list_windows())
+    if main is None:
+        raise SearchError("没有找到微信主窗口，请确认微信已登录并显示在屏幕上")
+
+    for _ in range(3):
+        if not force_foreground(main.hwnd):
+            time.sleep(0.4)
+            continue
+        time.sleep(0.4)
+        _open_add_friend_from_menu(main, adapter)
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            window = find_add_friend_window(adapter)
+            if window is not None:
+                return window
+            time.sleep(0.3)
+
+    raise SearchError("自动打开「添加朋友」窗口失败，请手动点开后重试")
 
 
 def build_search_key(contact: dict, fallback: str = "") -> str:
@@ -247,6 +374,30 @@ def paste_search_key() -> None:
     user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, None)
 
 
+_ID_CHARS = re.compile(r"[^a-z0-9]")
+
+
+def _normalize_id(value: str) -> str:
+    return _ID_CHARS.sub("", (value or "").casefold())
+
+
+def _wechat_id_close(text: str, target: str) -> bool:
+    """判断 OCR 出来的文字里是否含有目标微信号。
+
+    系统 OCR 常把微信号里的 1 读成 l、把下划线读丢，精确比对会漏判；
+    这里去掉非字母数字后按相似度兜底，长度差超过 2 个字符就不算。
+    """
+    want = _normalize_id(target)
+    seen = _normalize_id(text)
+    if len(want) < 6 or not seen:
+        return False
+    if want in seen:
+        return True
+    if abs(len(seen) - len(want)) > 2:
+        return False
+    return SequenceMatcher(None, seen, want).ratio() >= 0.82
+
+
 def _extract_identifiers(text: str) -> tuple[set[str], set[str]]:
     """从一行 OCR 文字里抽出微信号和手机号。"""
     wechat_ids = set(contact_reader.WECHAT_ID_PATTERN.findall(text))
@@ -307,6 +458,9 @@ def parse_search_result(lines: list[dict], contact: dict, search_key: str = "") 
             wechat_id.casefold() == target_wechat_id.casefold()
             for wechat_id in wechat_ids
         ):
+            line_matched.append("wechat_id")
+        elif target_wechat_id and _wechat_id_close(text, target_wechat_id):
+            # OCR 把微信号认错一两个字符时按相似度兜底
             line_matched.append("wechat_id")
         for item in line_matched:
             if item not in matched_by:
@@ -394,17 +548,18 @@ def verify_task(
         raise SearchError("该联系人没有手机号或微信号，无法搜索")
 
     adapter = adapter or WeChatUiAdapter()
-    window = find_add_friend_window(adapter)
-    if window is None:
-        raise SearchError("未找到「添加朋友」窗口，请先在微信中打开它并保留在屏幕上")
+    window = ensure_add_friend_window(adapter)
 
     active = force_foreground(window.hwnd)
     if auto_input:
         if not active:
             raise SearchError("无法把「添加朋友」窗口切到前台，请手动点击该窗口后重试")
+        _focus_search_box(window, adapter)
+        _select_all()
         copy_text(search_key)
         paste_search_key()
         time.sleep(PASTE_WAIT_SECONDS)
+        _click_search_button(window, adapter)
     elif copy_to_clipboard:
         copy_text(search_key)
 

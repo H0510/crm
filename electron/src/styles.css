@@ -1,0 +1,125 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --line: #e3e6eb;
+  --text: #1f2329;
+  --muted: #6b7280;
+  --brand: #1f7a5c;
+  --brand-soft: #e6f4ef;
+  --warn: #b7791f;
+  --danger: #c0392b;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+/* 三个页面共用的基础控件，配色与工作台保持一致 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: #fff;
+}
+
+.btn--ghost {
+  background: transparent;
+}
+
+.btn--sm {
+  padding: 4px 9px;
+  font-size: 11px;
+}
+
+.input {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+
+.input:focus {
+  border-color: var(--brand);
+}
+
+.tag {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #eef1f5;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tag--high {
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+
+.tag--medium {
+  background: #fdf3e2;
+  color: var(--warn);
+}
+
+.tag--low {
+  background: #f8ebea;
+  color: var(--danger);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #eef1f5;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pill--on {
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+
+.pill--warn {
+  background: #fdf3e2;
+  color: var(--warn);
+}
+
+.pill--off {
+  background: #f8ebea;
+  color: var(--danger);
+}
