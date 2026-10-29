@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -39,8 +40,10 @@ UI_LABELS = {
 
 # 通讯录列表里只有联系人行带头像，组织名等分组标题是纯文字行。
 # OCR 对「名字 + @微信号」这种彩色排版识别很差，因此改用头像像素定位可点击行。
-AVATAR_BAND_LEFT = 0.09
-AVATAR_BAND_RIGHT = 0.15
+# 头像在列表里的横向位置是固定像素（列表左边缘再往里约 40px），不随窗口宽度缩放；
+# 用宽度的百分比算在窄窗口上会整个偏掉，这里按像素给区间。
+AVATAR_BAND_LEFT = 92
+AVATAR_BAND_RIGHT = 142
 AVATAR_MIN_HEIGHT = 20
 AVATAR_MAX_HEIGHT = 58
 AVATAR_MIN_HITS = 12
@@ -48,6 +51,13 @@ AVATAR_GAP_TOLERANCE = 6
 # 白底、浅色头像和列表底色的差异很小，阈值压低到 30 才认得出；
 # 纯文字的分组标题行高不到 AVATAR_MIN_HEIGHT，不会因为阈值变低被误判成联系人行
 AVATAR_COLOR_DELTA = 30
+
+# 窗口太窄时微信会把右侧资料栏收起来，点联系人拿不到资料卡（表现为扫 0 人）。
+# 采集前先把窗口撑到三栏布局的最小尺寸。
+LAYOUT_MIN_WIDTH = 860
+LAYOUT_MIN_HEIGHT = 600
+LAYOUT_TARGET = (900, 640)
+SWP_NOZORDER_NOACTIVATE = 0x0004 | 0x0010
 
 
 class CollectError(Exception):
@@ -97,8 +107,8 @@ def _avatar_rows(image, min_y: int, max_y: int) -> list[dict]:
     的彩色排版又识别很差，因此用头像色块定位行，比 OCR 行更稳。
     """
     width, height = image.size
-    x0 = max(60, int(width * AVATAR_BAND_LEFT))
-    x1 = min(int(width * AVATAR_BAND_RIGHT), int(width * 0.33))
+    x0 = max(60, AVATAR_BAND_LEFT)
+    x1 = min(AVATAR_BAND_RIGHT, int(width * 0.45))
     if x1 - x0 < 12:
         return []
 
@@ -187,8 +197,8 @@ def _fill_missing_rows(image, rows: list[dict], min_y: int, max_y: int) -> list[
     pitch = steps[len(steps) // 2]
 
     width, _ = image.size
-    x0 = max(60, int(width * AVATAR_BAND_LEFT))
-    x1 = min(int(width * AVATAR_BAND_RIGHT), int(width * 0.33))
+    x0 = max(60, AVATAR_BAND_LEFT)
+    x1 = min(AVATAR_BAND_RIGHT, int(width * 0.45))
     bg_x = max(0, x0 - 8)
     need = max(6, (x1 - x0) // 5)
     pixels = image.load()
@@ -205,6 +215,61 @@ def _fill_missing_rows(image, rows: list[dict], min_y: int, max_y: int) -> list[
                 result.append({"y": y, "top": y - 10, "bottom": y + 10})
     result.append(rows[-1])
     return result
+
+
+def _merge_name_rows(
+    rows: list[dict], lines: list[dict], width: int, min_y: int, max_y: int
+) -> list[dict]:
+    """头像定位漏掉的行用 OCR 名字行补回来。
+
+    浅色头像、整张照片的头像和底色差异小，色块高度不够会被 _avatar_rows 丢掉，
+    而名字是黑字，OCR 反而是稳的。这里只认列表正文里的名字行：过滤入口和分组
+    标题，并要求落在已有行的行距网格上，避免把「A」这类首字母当联系人。
+    """
+    if not lines:
+        return rows
+    ys = [row["y"] for row in rows]
+    pitch = 54
+    steps = [b - a for a, b in zip(ys, ys[1:]) if 30 <= b - a <= 90]
+    if steps:
+        steps.sort()
+        pitch = steps[len(steps) // 2]
+
+    merged = list(rows)
+    for line in lines:
+        text = _compact(line.get("text", ""))
+        if len(text) < 2 or text in UI_LABELS:
+            continue
+        # 分组标题右侧的人数是单独一行的纯数字（「企业微信联系人 14」「联系人 179」），
+        # 它不是人名，补成行就会点进分组标题把计数当昵称写库
+        if text.isdigit():
+            continue
+        if any(
+            wechat_detector.fuzzy_hit(text, hint)
+            for hint in ("通讯录管理", "公众号", "企业微信联系人", "星标朋友", "搜索")
+        ):
+            continue
+        left = float(line.get("x") or 0)
+        y = int(float(line.get("y") or 0))
+        if not 70 <= left <= width * 0.62:
+            continue
+        if not min_y <= y <= max_y:
+            continue
+        if ys and min(abs(y - value) for value in ys) <= 24:
+            continue
+        if ys:
+            gap = abs((y - ys[0]) % pitch)
+            if min(gap, pitch - gap) > 14:
+                continue
+        merged.append({"y": y, "top": y - 10, "bottom": y + 10})
+    merged.sort(key=lambda row: row["y"])
+    unique: list[dict] = []
+    for row in merged:
+        # 补进来的名字行可能和头像行落在同一行，间隔小于 20px 就并成一行
+        if unique and row["y"] - unique[-1]["y"] < 20:
+            continue
+        unique.append(row)
+    return unique
 
 
 def _list_still(before, after) -> bool:
@@ -242,6 +307,15 @@ class AddressBookCollector:
             window = self.adapter.main_window()
             if window is None:
                 raise CollectError("未找到微信主窗口")
+            # 窗口最小化时截出来是全黑，先还原并放到前台再读取界面文字
+            friend_search.force_foreground(window.hwnd)
+            time.sleep(0.3)
+            window = self._window(window)
+            # 换号或停在聊天页时先自动切到通讯录页，避免后面把点击打到聊天窗口里
+            self._ensure_wide_layout(window)
+            window = self._window(window)
+            self._activate_contacts_page(window)
+            window = self._window(window)
             lines = self.adapter.read_text(window.hwnd)
             try:
                 self._ensure_contacts_page(window, lines)
@@ -264,6 +338,7 @@ class AddressBookCollector:
             "created": 0,
             "updated": 0,
             "skipped": 0,
+            "stop_reason": "",
             "max_contacts": max_contacts,
             "settle_seconds": settle_seconds,
             "hwnd": window.hwnd,
@@ -310,15 +385,17 @@ class AddressBookCollector:
             time.sleep(0.3)
             self._scroll_to_top(window)
             processed: set[str] = set()
+            previous_key = ""
+            stop_reason = ""
             idle_screens = 0
             screens = 0
-            previous_key = ""
 
             # 按本次识别到的联系人数量停止：重复采集时这些联系人会被更新而不是新增，
             # 只看 created 会一直扫到列表结束
             while len(processed) < job["max_contacts"] and screens < 400:
                 if job["cancel"]:
                     job["state"] = "cancelled"
+                    stop_reason = "cancelled"
                     break
                 # 用户中途拖动过窗口时，坐标会整体平移，按旧位置点会点到窗口外面，
                 # 表现就是一直点不动、以为见底了。每屏重新取一次窗口位置。
@@ -329,7 +406,9 @@ class AddressBookCollector:
                 if not rows:
                     idle_screens += 1
                     if idle_screens >= 3:
-                        raise CollectError("联系人列表没有识别到可点击的行，请确认微信停在通讯录页")
+                        raise CollectError(
+                            "联系人列表没有识别到可点击的行，请确认微信停在通讯录页"
+                        )
                     self._scroll(window)
                     screens += 1
                     continue
@@ -348,6 +427,9 @@ class AddressBookCollector:
                     key = profile_key(record)
                     if not key:
                         continue
+                    logger.info(
+                        "row y=%s key=%s new=%s", row["y"], key, key not in processed
+                    )
                     previous_key = key
                     saved = self.database.save_profile_candidate(record)
                     processed.add(key)
@@ -362,27 +444,50 @@ class AddressBookCollector:
 
                 if processed == before:
                     idle_screens += 1
+                    if idle_screens < 3:
+                        # 这一屏全是熟人，多半是滚轮被吞了没推进，多滚一段再试
+                        self._scroll(window, times=18)
+                        time.sleep(0.4)
                 else:
                     idle_screens = 0
-                if idle_screens >= 2:
+                logger.info(
+                    "screen=%s rows=%s new=%s scanned=%s skipped=%s idle=%s",
+                    screens,
+                    len(rows),
+                    len(processed) - len(before),
+                    job["scanned"],
+                    job["skipped"],
+                    idle_screens,
+                )
+                if idle_screens >= 3:
+                    stop_reason = "no_new_contacts"
                     break
 
                 before_scroll = screen_reader.capture_window(window.hwnd)
                 self._scroll(window)
                 screens += 1
                 time.sleep(0.5)
-                if _list_still(before_scroll, screen_reader.capture_window(window.hwnd)):
-                    # 滚不动有两种可能：真到底了，或者窗口刚被拖走、滚轮落到了窗口外。
-                    # 取一次新位置再滚一遍，还是不动才算到底
-                    window = self._window(window)
-                    before_scroll = screen_reader.capture_window(window.hwnd)
-                    self._scroll(window)
-                    time.sleep(0.5)
-                    if _list_still(before_scroll, screen_reader.capture_window(window.hwnd)):
+                if _list_still(
+                    before_scroll, screen_reader.capture_window(window.hwnd)
+                ):
+                    # 滚不动有三种可能：真到底了、窗口刚被拖走、截到画面刷新的瞬间。
+                    # 连续三次取最新位置重滚都不动，才认定到底
+                    for _ in range(2):
+                        window = self._window(window)
+                        before_scroll = screen_reader.capture_window(window.hwnd)
+                        self._scroll(window)
+                        time.sleep(0.5)
+                        if not _list_still(
+                            before_scroll, screen_reader.capture_window(window.hwnd)
+                        ):
+                            break
+                    else:
+                        stop_reason = "list_bottom"
                         break
 
             if job["state"] == "running":
                 job["state"] = "completed"
+            job["stop_reason"] = stop_reason
         except Exception as exc:  # noqa: BLE001 - 后台任务需要把异常反馈到接口
             logger.exception("通讯录采集失败")
             job["state"] = "failed"
@@ -393,6 +498,77 @@ class AddressBookCollector:
             AUTOMATION_LOCK.release()
 
     # ------------------------------------------------------------ 页面与行定位
+
+    @staticmethod
+    def _ensure_wide_layout(window: wechat_detector.WindowInfo) -> None:
+        """窗口太窄时微信会收起右侧资料栏，点联系人读不到资料卡。
+
+        采集全程在同一个窗口里读资料卡，所以先把窗口撑到三栏布局的最小尺寸；
+        已经是宽窗口就不动它。
+        """
+        left, top, right, bottom = window.rect
+        width, height = right - left, bottom - top
+        if width >= LAYOUT_MIN_WIDTH and height >= LAYOUT_MIN_HEIGHT:
+            return
+        user32.SetWindowPos(
+            window.hwnd,
+            0,
+            left,
+            top,
+            max(width, LAYOUT_TARGET[0]),
+            max(height, LAYOUT_TARGET[1]),
+            SWP_NOZORDER_NOACTIVATE,
+        )
+        time.sleep(0.5)
+
+    def _activate_contacts_page(self, window: wechat_detector.WindowInfo) -> None:
+        """确认停在通讯录页并选中一个联系人；停在聊天页时自动点左侧栏切过去。
+
+        换账号或刚聊完天时，微信停在会话窗口，此时直接采集会把点击打到聊天窗口里。
+        左侧栏「通讯录」图标位置固定，按头像区下方的几档高度逐个试，切成功即停。
+        """
+        window = self._window(window)
+        rows = self._contact_rows(window)
+        if rows and self._has_profile(self.adapter.read_text(window.hwnd)):
+            return
+
+        if not rows:
+            width, height = _window_size(window)
+            if width < 200 or height < 200:
+                raise CollectError("微信窗口已最小化，请先把窗口还原")
+            # 左侧栏图标是固定像素布局：聊天约 118、通讯录约 172、收藏约 210（以窗口顶为原点），
+            # 和窗口高度无关，所以按像素试而不是按比例
+            for offset in (172, 168, 176, 164, 180):
+                if offset >= height:
+                    continue
+                friend_sender.click_point(window, 36, offset, self.adapter)
+                time.sleep(0.6)
+                window = self._window(window)
+                rows = self._contact_rows(window)
+                if rows:
+                    break
+            else:
+                raise CollectError("切不到微信「通讯录」页，请手动点一下左侧的联系人图标")
+
+        if self._has_profile(self.adapter.read_text(window.hwnd)):
+            return
+        # 切到通讯录页后右侧还是空的，需要点一行打开资料卡
+        for row in rows[:3]:
+            friend_sender.click_point(
+                window, int(_window_size(window)[0] * 0.16), row["y"], self.adapter
+            )
+            time.sleep(0.7)
+            window = self._window(window)
+            if self._has_profile(self.adapter.read_text(window.hwnd)):
+                return
+
+    @staticmethod
+    def _has_profile(lines: list[dict]) -> bool:
+        return any(
+            wechat_detector.fuzzy_hit(line.get("text", ""), hint)
+            for line in lines
+            for hint in ("朋友资料", "微信号", "徵信号")
+        )
 
     @staticmethod
     def _ensure_contacts_page(
@@ -430,11 +606,29 @@ class AddressBookCollector:
         lines = screen_reader.ocr_image(image)
         min_y = self._list_top(lines)
         rows = _avatar_rows(image, min_y, image.height - 4)
-        return _fill_missing_rows(image, rows, min_y, image.height - 4)
+        rows = _fill_missing_rows(image, rows, min_y, image.height - 4)
+        return _merge_name_rows(rows, lines, image.width, min_y, image.height - 4)
 
     @staticmethod
     def _list_top(lines: list[dict]) -> int:
-        """列表正文起点：特殊入口行（公众号 / 企业微信联系人）之下。"""
+        """列表正文起点，取「联系人」分组标题之下。
+
+        「联系人」这一组才是要采的人。公众号服务号、企业微信联系人这两组即使被
+        展开，它们的行也都在「联系人」标题之上，所以下限必须用「联系人」标题算，
+        不能拿上面那两行当锚点，否则会把企业号和分组计数（如「14」「179」）当成
+        联系人写进库。
+        """
+        header = next(
+            (
+                line
+                for line in lines
+                if re.fullmatch(r"[>〉v∨]?联系人", _compact(line.get("text", "")))
+            ),
+            None,
+        )
+        if header is not None:
+            # 标题行本身约 40px 高，紧跟其下的几像素仍是标题区，留够距离再算正文
+            return int(float(header.get("y") or 0)) + 40
         special = [
             line
             for line in lines
@@ -443,12 +637,6 @@ class AddressBookCollector:
         ]
         if special:
             return int(max(float(line.get("y") or 0) for line in special)) + 25
-        header = next(
-            (line for line in lines if _compact(line.get("text", "")) == "联系人"),
-            None,
-        )
-        if header is not None:
-            return int(float(header.get("y") or 0)) + 25
         # 分组入口滚出视野时没有锚点，取搜索框下方的固定位置，避免点到顶部入口
         return 110
 
@@ -469,13 +657,16 @@ class AddressBookCollector:
         width, _ = _window_size(window)
         wait = max(float(job["settle_seconds"]), 0.5)
         record: dict = {}
-        for index, ratio in enumerate((0.16, 0.22)):
+        # 点击落点取头像带中心再往右一点，窄窗口按宽度百分比算会落到列表左侧空白上
+        for index, offset_x in enumerate((AVATAR_BAND_LEFT + 24, AVATAR_BAND_LEFT + 40)):
             if index:
                 # 第一遍点完没反应，可能就是窗口刚被拖走了，重取位置再试
                 window = self._window(window)
+            if offset_x >= width - 20:
+                offset_x = max(AVATAR_BAND_LEFT + 4, width // 3)
             offset = 0 if index == 0 else 8
             friend_sender.click_point(
-                window, int(width * ratio), int(row["y"]) + offset, self.adapter
+                window, offset_x, int(row["y"]) + offset, self.adapter
             )
             for _ in range(3):
                 time.sleep(wait)
@@ -490,10 +681,10 @@ class AddressBookCollector:
         fresh = self.adapter.find_window(hwnd=window.hwnd)
         return fresh or window
 
-    def _scroll(self, window: wechat_detector.WindowInfo) -> None:
+    def _scroll(self, window: wechat_detector.WindowInfo, times: int = 9) -> None:
         # 实测一格滚轮约 25px、联系人行约 54px，9 次（18 格）推进约 8 行，
         # 视野内保留 1~2 行的重叠，既不漏人也不会每屏只前进一个人
-        _wheel(self._window(window), -240, 9)
+        _wheel(self._window(window), -240, times)
 
     def _scroll_to_top(self, window: wechat_detector.WindowInfo) -> None:
         """先把焦点放到左侧列表并回到顶部，避免从中间开始采集。"""
@@ -506,17 +697,24 @@ class AddressBookCollector:
         user32.mouse_event(0x0002, 0, 0, 0, None)
         user32.mouse_event(0x0004, 0, 0, 0, None)
         time.sleep(0.15)
-        for _ in range(4):
+        # 一格滚轮只走二十几像素，从列表末尾倒回顶部要滚上千次，必须先用 Home 跳。
+        # Home 只对拿到键盘焦点的列表生效，所以上面先点一下列表。
+        for _ in range(6):
+            _press_key(0x24)  # VK_HOME
+            time.sleep(0.35)
             window = self._window(window)
-            _wheel(window, 120, 800)
-            time.sleep(0.5)
             if self._at_list_top(window):
                 return
+            _wheel(window, 120, 1500)
+            time.sleep(0.3)
 
     def _at_list_top(self, window: wechat_detector.WindowInfo) -> bool:
         """只 OCR 列表顶部一小块，判断是否真的回到了通讯录最上方。"""
-        image = screen_reader.capture_window(window.hwnd)
         width, height = _window_size(window)
+        if width < 200 or height < 200:
+            # 窗口被最小化时 rect 是 -32000，裁切会直接抛坐标错误
+            return False
+        image = screen_reader.capture_window(window.hwnd)
         top = image.crop((70, 60, int(width * 0.33), min(height, 260)))
         lines = screen_reader.ocr_image(top, scale=3)
         return any(wechat_detector.fuzzy_hit(line.get("text", ""), "新的朋友") for line in lines)
@@ -528,7 +726,10 @@ class AddressBookCollector:
         备注、地区等字段就会被列表文字污染，所以这里直接裁掉列表再识别。
         """
         width, _ = _window_size(window)
-        crop_x = int(width * 0.35)
+        # 列表栏宽度有上限（约 520px），资料栏起点固定在 552 左右。按宽度百分比裁，
+        # 900 宽时只裁到 315，列表里的「联系人 179」这类文字会跟着进 OCR，
+        # 被当成昵称写库
+        crop_x = min(int(width * 0.62), 552)
         image = screen_reader.capture_window(window.hwnd)
         cropped = image.crop((crop_x, 0, image.width, image.height))
         profile_lines = self._ocr_profile(cropped, crop_x, scale=2)
@@ -557,7 +758,41 @@ class AddressBookCollector:
         if recovered != record["wechat_id"]:
             record["wechat_id"] = recovered
             self._set_field(record, "wechat_id", recovered, "high")
+
+        if not record["wechat_id"]:
+            # 全屏或大窗口时整块 OCR 会把微信号那行小字认错（zuy2310 认成「一 202310」），
+            # 单独裁这一行放大再读一次
+            reread = self._reread_id(cropped, profile_lines, crop_x)
+            if reread:
+                record["wechat_id"] = reread
+                self._set_field(record, "wechat_id", reread, "medium")
         return record
+
+    @staticmethod
+    def _reread_id(cropped, lines: list[dict], crop_x: int) -> str:
+        for line in lines:
+            if not wechat_detector.fuzzy_hit(line.get("text", ""), "信号"):
+                continue
+            left = int(float(line.get("x") or 0)) - crop_x
+            top = int(float(line.get("y") or 0))
+            width = int(float(line.get("width") or 240))
+            height = int(float(line.get("height") or 24))
+            box = (
+                max(0, left - 8),
+                max(0, top - 8),
+                min(cropped.width, left + width + 60),
+                min(cropped.height, top + height + 8),
+            )
+            if box[2] - box[0] < 20 or box[3] - box[1] < 12:
+                continue
+            piece = cropped.crop(box)
+            text = "".join(
+                item.get("text", "") for item in screen_reader.ocr_image(piece, scale=4)
+            )
+            record = parse_profile([{"text": text, "x": 0, "y": 0}])
+            if record["wechat_id"]:
+                return record["wechat_id"]
+        return ""
 
     @staticmethod
     def _ocr_profile(cropped, crop_x: int, scale: int) -> list[dict]:
