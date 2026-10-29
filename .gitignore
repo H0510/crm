@@ -9,6 +9,9 @@ python/dist/
 # Python 缓存
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # 本地数据库与备份
 python/data/*.db
+python/data/*.db-wal
+python/data/*.db-shm
